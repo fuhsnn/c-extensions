@@ -1882,7 +1882,8 @@ static bool is_supported_attr(bool is_bracket, Token *vendor, Token *tok) {
 
   if (gnu_if_battr && is_gnu_attr(tok))
     return true;
-
+  if (vendor && equal(vendor, "slimcc") && equal(tok, "gate"))
+    return true;
   return false;
 }
 

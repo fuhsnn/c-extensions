@@ -148,7 +148,7 @@ static Type *initializer(Token **rest, Initializer *init, Token *tok, Type *ty);
 static Node *lvar_initializer(Token **rest, Token *tok, Obj *var);
 static void gvar_initializer(Token **rest, Token *tok, Obj *var);
 static void constexpr_initializer(Token **rest, Token *tok, Obj *init_var, Obj *var);
-static Node *compound_stmt(Token **rest, Token *tok, NodeKind kind);
+static Node *compound_stmt(Token **rest, Token *tok, NodeKind kind, Token *gate_list);
 static Node *stmt(Token **rest, Token *tok, Token *label_list);
 static Node *expr_stmt(Token **rest, Token *tok);
 static Node *expr(Token **rest, Token *tok);
@@ -237,9 +237,21 @@ static bool is_constant_context(void) {
   return scope->parent == NULL || is_global_init_context;
 }
 
+bool in_gate_allowlist(Scope *sc, Token *tok) {
+  if (!sc->gate_allowlist)
+    return true;
+  for (Token *t = sc->gate_allowlist; t; t = t->label_next) {
+    if (equal_tok(t, tok))
+      return true;
+  }
+  return false;
+}
+
 // Find a variable by name.
 static VarScope *find_var(Token *tok) {
   for (Scope *sc = scope; sc; sc = sc->parent) {
+    if (!in_gate_allowlist(sc, tok))
+      break;
     VarScope *sc2 = hashmap_get2(&sc->vars, tok->loc, tok->len);
     if (sc2)
       return sc2;
@@ -249,6 +261,8 @@ static VarScope *find_var(Token *tok) {
 
 static Type *find_tag(Token *tok) {
   for (Scope *sc = scope; sc; sc = sc->parent) {
+    if (!in_gate_allowlist(sc, tok))
+      break;
     Type *ty = hashmap_get2(&sc->tags, tok->loc, tok->len);
     if (ty)
       return ty;
@@ -840,6 +854,33 @@ static void func_attr(Obj *fn, VarAttr *attr, Token *name, Token *tok) {
     DeclAttr(bool_attr, "gnu_inline", &is_gnu_inline);
     fn->only_inline = is_gnu_inline && attr->is_inline && attr->is_extern;
   }
+}
+
+static Token *attr_gate(Token *loc, TokenKind kind) {
+  for (Token *tok = loc->attr_next; tok; tok = tok->attr_next) {
+    if (tok->kind != kind)
+      continue;
+    if (equal_ext(tok, "gate")) {
+      tok = skip(tok->next, "(");
+
+      if (equal(tok, ")")) {
+        static Token nomatch;
+        return &nomatch;
+      }
+
+      Token head = {0};
+      Token *cur = &head;
+      while (comma_list(&tok, &tok, ")", cur != &head)) {
+        if (tok->kind != TK_IDENT)
+          error_tok(tok, "expected identifier");
+        cur = cur->label_next = tok;
+        tok = tok->next;
+      }
+      cur->label_next = NULL;
+      return head.label_next;
+    }
+  }
+  return NULL;
 }
 
 // declspec = ("void" | "_Bool" | "char" | "short" | "int" | "long"
@@ -2579,7 +2620,7 @@ static Token *label_stmt(Node **cur_node, Token **rest, Token *tok) {
 
 static Node *secondary_block(Token **rest, Token *tok) {
   if (equal(tok, "{"))
-    return compound_stmt(rest, tok->next, ND_BLOCK);
+    return compound_stmt(rest, tok->next, ND_BLOCK, attr_gate(tok, TK_BATTR));
 
   DeferStmt *dfr = new_block_scope();
   Node head = {0};
@@ -2791,15 +2832,16 @@ static Node *stmt(Token **rest, Token *tok, Token *label_list) {
   }
 
   if (equal(tok, "{"))
-    return compound_stmt(rest, tok->next, ND_BLOCK);
+    return compound_stmt(rest, tok->next, ND_BLOCK, attr_gate(tok, TK_BATTR));
 
   return expr_stmt(rest, tok);
 }
 
 // compound-stmt = (typedef | declaration | stmt)* "}"
-static Node *compound_stmt(Token **rest, Token *tok, NodeKind kind) {
+static Node *compound_stmt(Token **rest, Token *tok, NodeKind kind, Token *gate_allowlist) {
   Node *node = new_node(kind, tok);
   node->defr_end = current_defr;
+  scope->gate_allowlist = gate_allowlist;
   enter_scope();
 
   Node head = {0};
@@ -2845,6 +2887,7 @@ static Node *compound_stmt(Token **rest, Token *tok, NodeKind kind) {
   node->defr_start = current_defr;
   current_defr = node->defr_end;
   leave_scope();
+  scope->gate_allowlist = NULL;
 
   if (kind == ND_STMT_EXPR && cur->kind == ND_EXPR_STMT) {
     add_type(cur->lhs);
@@ -4726,7 +4769,7 @@ static Node *primary(Token **rest, Token *tok) {
     if (is_constant_context())
       error_tok(tok, "statement expresssion in constant context");
 
-    Node *node = compound_stmt(&tok, tok->next->next, ND_STMT_EXPR);
+    Node *node = compound_stmt(&tok, tok->next->next, ND_STMT_EXPR, attr_gate(tok, TK_BATTR));
     *rest = skip(tok, ")");
     return node;
   }
@@ -5000,7 +5043,7 @@ static void func_definition(Token **rest, Token *tok, Obj *fn, Type *ty) {
     ty->scopes = scope;
   }
 
-  fn->body = compound_stmt(rest, tok->next, ND_BLOCK);
+  fn->body = compound_stmt(rest, tok->next, ND_BLOCK, attr_gate(tok, TK_BATTR));
 
   if (ty->pre_calc) {
     Node *calc = new_unary(ND_EXPR_STMT, ty->pre_calc, tok);

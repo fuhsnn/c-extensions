@@ -521,6 +521,8 @@ struct Scope {
 
   Obj *locals;
   bool is_temporary;
+  Token *gate_allowlist;
+
   // C has two block scopes; one is for variables/typedefs and
   // the other is for struct/union/enum tags.
   HashMap vars;
