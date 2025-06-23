@@ -4434,6 +4434,85 @@ static Node *generic_selection(Token **rest, Token *tok) {
   return ret;
 }
 
+static Node *match_type(Token **rest, Token *tok) {
+  Token *start = tok;
+  tok = skip(tok, "(");
+
+  Type *t1;
+  if (is_typename(tok)) {
+    t1 = typename(&tok, tok);
+  } else {
+    Node *ctrl = assign(&tok, tok);
+    add_type(ctrl);
+    t1 = unqual(ptr_decay(ctrl->ty));
+  }
+  Token *ret = NULL;
+  Token *def = NULL;
+
+  while (comma_list(rest, &tok, ")", true)) {
+    if (equal(tok, "default")) {
+      def = skip(tok->next, ":");
+      tok = skip_paren(skip(def, "("));
+      continue;
+    }
+
+    Type *t2 = typename(&tok, tok);
+    Token *cand = skip(tok, ":");
+    tok = skip_paren(skip(cand, "("));
+    if (is_compatible2(t1, t2)) {
+      if (ret) {
+        notice_tok(ret, "ambiguous selection");
+        error_tok(cand, "with this option");
+      }
+      ret = cand;
+    }
+  }
+  if (!ret)
+    ret = def;
+  if (!ret)
+    error_tok(start, "no match found");
+  return assign(&(Token *){0}, ret);
+}
+
+static Node *match_int(Token **rest, Token *tok) {
+  Token *start = tok;
+  tok = skip(tok, "(");
+
+  Type *ty;
+  int64_t sel = const_expr2(&tok, tok, &ty);
+
+  Token *ret = NULL;
+  Token *def = NULL;
+
+  while (comma_list(rest, &tok, ")", true)) {
+    if (equal(tok, "default")) {
+      def = skip(tok->next, ":");
+      tok = skip_paren(skip(def, "("));
+      continue;
+    }
+
+    Type *opt_ty;
+    int64_t opt = const_expr2(&tok, tok, &opt_ty);
+    if (!is_compatible(ty, opt_ty))
+      error_tok(tok, "incompatible type");
+
+    Token *cand = skip(tok, ":");
+    tok = skip_paren(skip(cand, "("));
+    if (opt == sel) {
+      if (ret) {
+        notice_tok(ret, "ambiguous selection");
+        error_tok(cand, "with this option");
+      }
+      ret = cand;
+    }
+  }
+  if (!ret)
+    ret = def;
+  if (!ret)
+    error_tok(start, "no match found");
+  return assign(&(Token *){0}, ret);
+}
+
 static Node *checked_arith(Token **rest, Token *tok, NodeKind kind) {
   Node *node = new_node(ND_CKD_ARITH, tok);
   node->arith_kind = kind;
@@ -4794,6 +4873,12 @@ static Node *primary(Token **rest, Token *tok) {
     }
     error_tok(tok, "countof applied to non-array type");
   }
+
+  if (equal(tok, "_Match_int"))
+    return match_int(rest, tok->next);
+
+  if (equal(tok, "_Match_type"))
+    return match_type(rest, tok->next);
 
   if (equal(tok, "_Generic"))
     return generic_selection(rest, tok->next);
