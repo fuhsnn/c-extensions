@@ -1,9 +1,46 @@
 This is a collection of extensions to C programming language implemented as patches to the [slimcc](https://github.com/fuhsnn/slimcc) compiler, done mostly for fun, may not be well thought out. They're kept in [separate branches](https://github.com/fuhsnn/c-extensions/branches) for better view-ability and to keep upstream codebase flexible. For building the compiler please refer to [upstream readme](https://github.com/fuhsnn/slimcc?tab=readme-ov-file#building-and-using).
 
+ - [`for LoopName (...)`](#alt-named-loops-syntax)
  - [`[[gate(allowlist)]]`](#attr-gate)
  - [`_Match_type()`](#match-type)
  - [`_Match_int()`](#match-int)
 
+<a name="alt-named-loops-syntax"></a>
+## [Alternative C2Y named loops syntax](https://github.com/fuhsnn/c-extensions/tree/alt-named-loops-syntax)
+
+An implementation of the [n3377 proposal to WG14](https://www.open-std.org/jtc1/sc22/wg14/www/docs/n3377.pdf) because I'm sympathetic to it.
+
+It's done on top of the label-based syntax, so those still work. `do while` loops are implemented differently because slimcc's current structure is too single-pass-y to support it elegantly, the name is positioned after `do` and only work for curly braced blocks.
+
+Runnable example:
+```C
+#include <stdio.h>
+
+int main(void) {
+  int i = 0;
+  do DW1 {
+    For_lab2:
+    for For_lab1 (int j = 0; j < 10; j++) {
+        switch S1 (j) {
+        case 3:
+            break;
+        case 2:
+            continue For_lab1;
+        case 5:
+            break S1;
+        default:
+            continue;
+        }
+        if ((i % j) == 0) {
+            printf("%d\n",i);
+            break For_lab2;
+        }
+    }
+    while W1 (i++ > 25)
+        break DW1;
+  } while (1);
+}
+```
 
 <a name="attr-gate"></a>
 ## [Block attribute `[[gate(allowlist)]]`](https://github.com/fuhsnn/c-extensions/tree/attr-gate)
