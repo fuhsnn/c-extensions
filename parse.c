@@ -2656,6 +2656,14 @@ static JumpContext *resolve_labeled_jump(Token **rest, Token *tok, bool is_cont)
   error_tok(tok, "cannot resolve jump");
 }
 
+void alt_named_loop_syntax(Token **rest, Token *tok, Token **label_list) {
+  if (tok->kind == TK_IDENT) {
+    tok->label_next = *label_list;
+    *label_list = tok;
+    *rest = tok->next;
+  }
+}
+
 // stmt = "return" expr? ";"
 //      | "if" "(" expr ")" stmt ("else" stmt)?
 //      | "switch" "(" expr ")" stmt
@@ -2697,10 +2705,12 @@ static Node *stmt(Token **rest, Token *tok, Token *label_list) {
   }
 
   if (equal(tok, "switch")) {
+    tok = tok->next;
+    alt_named_loop_syntax(&tok, tok, &label_list);
     DeferStmt *dfr = new_block_scope();
 
     Node *node = new_node(ND_SWITCH, tok);
-    node->cond = cond_declaration(&tok, skip(tok->next, "("), ")", 0);
+    node->cond = cond_declaration(&tok, skip(tok, "("), ")", 0);
     add_type(node->cond);
     if (!is_integer(node->cond->ty))
       error_tok(tok, "controlling expression not integer");
@@ -2719,10 +2729,12 @@ static Node *stmt(Token **rest, Token *tok, Token *label_list) {
   }
 
   if (equal(tok, "for")) {
+    tok = tok->next;
+    alt_named_loop_syntax(&tok, tok, &label_list);
     DeferStmt *dfr = new_block_scope();
 
     Node *node = new_node(ND_FOR, tok);
-    tok = skip(tok->next, "(");
+    tok = skip(tok, "(");
 
     if (!static_assertion(&tok, tok)) {
       if (is_typename(tok)) {
@@ -2752,11 +2764,13 @@ static Node *stmt(Token **rest, Token *tok, Token *label_list) {
   }
 
   if (equal(tok, "while")) {
+    tok = tok->next;
+    alt_named_loop_syntax(&tok, tok, &label_list);
     DeferStmt *dfr = new_block_scope();
 
     Node *node = new_node(ND_FOR, tok);
     node->defr_end = current_defr;
-    node->cond = cond_cast(cond_declaration(&tok, skip(tok->next, "("), ")", 1));
+    node->cond = cond_cast(cond_declaration(&tok, skip(tok, "("), ")", 1));
     node->defr_start = current_defr;
 
     loop_body(rest, tok, node, label_list);
@@ -2765,9 +2779,13 @@ static Node *stmt(Token **rest, Token *tok, Token *label_list) {
   }
 
   if (equal(tok, "do")) {
+    tok = tok->next;
+    if (tok->kind == TK_IDENT && equal(tok->next, "{"))
+      alt_named_loop_syntax(&tok, tok, &label_list);
+
     Node *node = new_node(ND_DO, tok);
 
-    loop_body(&tok, tok->next, node, label_list);
+    loop_body(&tok, tok, node, label_list);
 
     tok = skip(tok, "while");
     tok = skip(tok, "(");
