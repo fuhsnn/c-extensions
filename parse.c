@@ -4480,10 +4480,14 @@ static Type *struct_union_decl(Token **rest, Token *tok, TypeKind kind) {
   attr_aligned(tok, &alt_align, TK_BATTR);
 
   // Read a tag.
-  Token *tag = NULL;
+  Token *tag = NULL, *comptag = NULL;
   if (tok->kind == TK_IDENT) {
     tag = tok;
     tok = tok->next;
+  } else if (tok->kind == TK_compat) {
+    tok = skip(tok->next, "(");
+    comptag = tok;
+    tok = skip(tok->next, ")");
   }
 
   Type *tag_compat_ty = NULL;
@@ -4527,6 +4531,11 @@ static Type *struct_union_decl(Token **rest, Token *tok, TypeKind kind) {
       Type *nxt = t->decl_next;
       new_derived_type(t, t->qual, ty);
       t = nxt;
+    }
+  } else {
+    if (comptag) {
+      comptag->is_live = true;
+      ty->comptag = comptag;
     }
   }
   return ty;

@@ -300,6 +300,8 @@ static int64_t *get_arr_len(Type *ty) {
 }
 
 static bool is_tag_compat(Type *t1, Type *t2) {
+  if (t1->comptag && t2->comptag && equal_tok(t1->comptag, t2->comptag))
+    return true;
   return opt_std >= STD_C23 &&
     t1->tag && t2->tag && equal_tok(t1->tag, t2->tag);
 }

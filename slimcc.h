@@ -204,6 +204,7 @@ typedef enum {
   TK_nullptr,
   TK_defer,
   TK_FUNCTION,
+  TK_compat,
 
   TK_TYPEKW,
   TK_void,
@@ -746,6 +747,7 @@ struct Type {
   Type *origin;       // for type compatibility check
   Type *decl_next;    // forward declarations
   Token *tag;
+  Token *comptag;
   EnumVal *enums;
 
   // Pointer-to or array-of type. We intentionally use the same member
