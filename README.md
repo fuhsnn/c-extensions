@@ -1,9 +1,68 @@
-This is a collection of extensions to C programming language implemented as patches to the [slimcc](https://github.com/fuhsnn/slimcc) compiler, done mostly for fun, may not be well thought out. They're kept in [separate branches](https://github.com/fuhsnn/c-extensions/branches) for better view-ability and to keep upstream codebase flexible. For building the compiler please refer to [upstream readme](https://github.com/fuhsnn/slimcc?tab=readme-ov-file#building-and-using).
+This is a collection of extensions to C programming language implemented as patches to the [slimcc](https://github.com/fuhsnn/slimcc) compiler, done mostly for fun, may not be well thought out. They're kept in [separate branches](https://github.com/fuhsnn/c-extensions/branches) for better view-ability and to keep upstream codebase flexible. For building the compiler please refer to [upstream readme](https://github.com/fuhsnn/slimcc?tab=readme-ov-file#building-and-using). Examples may need `-std=c23` to build because slimcc hasn't default to that.
 
+ - [`struct _Compat(ident) {...}`](#compat-ident)
  - [`for LoopName (...)`](#alt-named-loops-syntax)
  - [`[[gate(allowlist)]]`](#attr-gate)
  - [`_Match_type()`](#match-type)
  - [`_Match_int()`](#match-int)
+
+<a name="compat-ident"></a>
+## [Compatibility identifiers](https://github.com/fuhsnn/c-extensions/tree/compat-ident)
+
+It's a common idiom to do generic types with macros like:
+```C
+#define span(T) struct span_##T { ssize_t N; T* data; }
+```
+However even with C23's tag compatibility rule, it's still not possible to use pointer types directly with this pattern (because the `*` cannot be macro-pasted with `span_##T`).
+
+`_Compat(ident)` is a simplified twist of the [N3332 _Record proposal](https://thephd.dev/_vendor/future_cxx/papers/C%20-%20_Record%20types.html), it appears in place of struct tag and cannot be mixed. Types declared with `_Compat` remain tag-less to the existing type system, only during compatibility checks, two types with the same `ident` count as having the same tag according to C23's rule.
+```C
+#include <stddef.h>
+#define vector(T) struct _Compat(vector) { T *ptr; size_t sz; }
+#define array(T) struct _Compat(array) { T *ptr; size_t sz; }
+
+// struct;                 // meaningless and invalid
+// struct _Compat(vector); // meaningless and invalid just like above
+
+// compatible: _Compat ident same, layout same
+static_assert(1 == _Generic(vector(int *), default: 0, vector(typeof(&(int){})): 1));
+
+// not compatible: _Compat ident same, layout differ
+static_assert(0 == _Generic(vector(int *), default: 0, vector(long *): 1));
+
+// not compatible: _Compat ident differ, layout same
+static_assert(0 == _Generic(vector(int *), default: 0, array(int *): 1));
+```
+Runnable example:
+```C
+#include <stdio.h>
+
+#def result(T)
+struct _Compat(result_v0) {
+  T val;
+  bool has_val;
+}
+#enddef
+
+result(int *) fn(int *p) {
+  if (p == nullptr)
+    return (result(int*)){.has_val = false};
+  else
+    return (result(int*)){p, true};
+}
+
+int main(void) {
+  if (auto e = fn(nullptr); e.has_val)
+    printf("e1 val %d\n", *e.val);
+  else
+    printf("e1 no val\n");
+
+  if (auto e = fn(&(int){3}); e.has_val)
+    printf("e2 val %d\n", *e.val);
+  else
+    printf("e2 no val\n");
+}
+```
 
 <a name="alt-named-loops-syntax"></a>
 ## [Alternative C2Y named loops syntax](https://github.com/fuhsnn/c-extensions/tree/alt-named-loops-syntax)
