@@ -24,6 +24,18 @@ static uint64_t fnv_hash(char *s, int len) {
   return hash;
 }
 
+void hashmap_merge_no_shadow(HashMap *dst, HashMap *src) {
+  for (int i = 0; i < src->capacity; i++) {
+    HashEntry *ent = &src->buckets[i];
+    if (ent->key && ent->key != TOMBSTONE) {
+      HashEntry *dstent = hashmap_get_or_insert(dst, ent->key, ent->keylen);
+      if (dstent->val)
+        continue;
+      dstent->val = ent->val;
+    }
+  }
+}
+
 // Make room for new entires in a given hashmap by removing
 // tombstones and possibly extending the bucket size.
 static void rehash(HashMap *map) {

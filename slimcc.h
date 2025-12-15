@@ -147,6 +147,7 @@ void hashmap_put2(HashMap *map, char *key, int keylen, void *val);
 void hashmap_delete(HashMap *map, char *key);
 void hashmap_delete2(HashMap *map, char *key, int keylen);
 void hashmap_test(void);
+void hashmap_merge_no_shadow(HashMap *dst, HashMap *src);
 
 //
 // strings.c
@@ -205,6 +206,8 @@ typedef enum {
   TK_defer,
   TK_FUNCTION,
 
+  TK_yield,
+
   TK_TYPEKW,
   TK_void,
   TK_char,
@@ -237,6 +240,8 @@ typedef enum {
   TK_typeof_unqual,
   TK_thread_local,
   TK_volatile,
+  TK_ctxof,
+  TK_wideof,
   TK_TYPEKW_END,
 } TokenKind;
 
@@ -353,6 +358,8 @@ struct Obj {
   int stack_offset;
   Node *arg_expr;
   Obj *param_promoted;
+  bool capture_by_ref;
+  bool capture_by_val;
 
   // Global variable or function
   bool is_definition;
@@ -391,6 +398,9 @@ struct Obj {
   uint16_t dtor_prior;
   Node *body;
   FuncObj *output; // backend defined output object
+
+  Obj *orig_var;
+  bool is_searched;
 };
 
 // Global variable can be initialized either by a constant expression
@@ -518,6 +528,14 @@ typedef enum {
   ND_THREAD_FENCE,
   ND_UNREACHABLE,
   ND_UNKNOWN,
+  ND_CORO_INIT,
+  ND_CORO_RESUME,
+  ND_CORO_YIELD,
+  ND_NESTED_CTX,
+  ND_NESTED_SELFCALL,
+  ND_WIDEFN_INIT,
+  ND_WIDEFN_PTR,
+  ND_WIDEFN_CALL,
 } NodeKind;
 
 typedef struct CaseRange CaseRange;
@@ -599,6 +617,8 @@ ANON_UNION_START
     Node *expr;
     Obj *rtn_buf;
     Obj *args;
+    Obj *cpt_ptr;
+    bool is_selfcall;
   } call;
 
   // Atomic compare-and-swap
@@ -630,6 +650,7 @@ struct Scope {
   Obj *locals;
   LocalLabel *labels;
   Node *gotos;
+  bool is_fnbase;
   bool is_temporary;
   bool is_stmt;
   bool has_label;
@@ -726,6 +747,8 @@ typedef enum {
   TY_BITINT,
   TY_AUTO,
   TY_ASM,
+  TY_NESTED_CONTEXT,
+  TY_WIDE_FN,
 } TypeKind;
 
 typedef enum {
@@ -734,6 +757,13 @@ typedef enum {
   Q_ATOMIC   = 1 << 2,
   Q_RESTRICT = 1 << 3,
 } QualMask;
+
+typedef enum {
+  CPT_NONE = 0,
+  CPT_CORO,
+  CPT_NESTED,
+  CPT_TYPE,
+} CptKind;
 
 struct Type {
   TypeKind kind;
@@ -783,6 +813,11 @@ struct Type {
   Node *pre_calc;
   bool is_variadic;
   bool is_oldstyle;
+
+  CptKind cpt_kind;
+  Type *cpt_ty;
+  Obj *cpt_vars;
+  Type *cpt_fn_ty;
 };
 
 // Struct member
@@ -879,6 +914,7 @@ int codegen(Obj *prog, FILE *out);
 void prepare_funcall(Node *node, Scope *scope);
 void prepare_inline_asm(Node *node);
 int64_t align_to(int64_t n, int64_t align);
+int get_align(Obj *var);
 bool va_arg_need_copy(Type *ty);
 bool bitint_rtn_need_copy(size_t width);
 void emit_text(Obj *fn);

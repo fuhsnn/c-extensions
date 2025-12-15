@@ -102,10 +102,12 @@ static int va_fp_start;
 static int va_st_start;
 static int vla_base_ofs;
 static int rtn_ptr_ofs;
+static int ref_ptr_ofs;
 static int lvar_stk_sz;
 static int peak_stk_usage;
 static int tmpbuf_sz;
 static int64_t rtn_label;
+static int64_t coro_label;
 static HashMap *ext_refs;
 static bool *debug_file_used;
 static int *debug_file_id;
@@ -257,7 +259,7 @@ static char *asm_name(Obj *var) {
   return var->asm_name ? var->asm_name : var->name;
 }
 
-static int get_align(Obj *var) {
+int get_align(Obj *var) {
   if (var->ty->kind == TY_VLA)
     return 8;
   if (var->alt_align)
@@ -361,6 +363,8 @@ static bool eval_memop(Node *node, char *ofs, char **ptr, bool let_array, bool l
   int offset;
   Obj *var = eval_var_opt(node, &offset, let_array, let_atomic);
   if (var) {
+    if (var->capture_by_ref || var->capture_by_val)
+      return false;
     if (var->is_local) {
       snprintf(ofs, STRBUF_SZ, "%d", offset + var->ofs);
       *ptr = var->ptr;
@@ -1035,6 +1039,15 @@ static void gen_addr(Node *node) {
       return;
     }
 
+    if (node->m.var->capture_by_ref || node->m.var->capture_by_val) {
+      Printftn("mov -%d(%s), %%rax", ref_ptr_ofs, lvar_ptr);
+      if (node->m.var->capture_by_val)
+        Printftn("add $%d, %%rax", node->m.var->ofs);
+      else
+        Printftn("mov %d(%%rax), %%rax", node->m.var->ofs);
+      return;
+    }
+
     // Local variable
     if (node->m.var->is_local) {
       Printftn("lea %d(%s), %%rax", node->m.var->ofs, node->m.var->ptr);
@@ -1090,12 +1103,21 @@ static void gen_addr(Node *node) {
     gen_addr(node->m.lhs);
     imm_add("%rax", "%rdx", node->m.member->offset);
     return;
+  case ND_WIDEFN_PTR: {
+    gen_addr(node->m.lhs);
+    Printstn("add $8, %%rax");
+    return;
+  }
   case ND_ASSIGN:
   case ND_COND:
+  case ND_CORO_INIT:
+  case ND_CORO_RESUME:
+  case ND_NESTED_SELFCALL:
+  case ND_WIDEFN_CALL:
   case ND_FUNCALL:
   case ND_STMT_EXPR:
   case ND_VA_ARG:
-    if (node->ty->kind == TY_STRUCT || node->ty->kind == TY_UNION) {
+    if (node->ty->kind == TY_STRUCT || node->ty->kind == TY_UNION || node->ty->kind == TY_WIDE_FN) {
       gen_expr(node);
       return;
     }
@@ -1139,11 +1161,13 @@ static void load(Node *node, int ofs) {
     return;
   }
   switch (node->ty->kind) {
+  case TY_WIDE_FN:
   case TY_ARRAY:
   case TY_STRUCT:
   case TY_UNION:
   case TY_FUNC:
   case TY_VLA:
+  case TY_NESTED_CONTEXT:
     // If it is an array, do not attempt to load a value to the
     // register because in general we can't load an entire array to a
     // register. As a result, the result of an evaluation of an array
@@ -1157,6 +1181,7 @@ static void load(Node *node, int ofs) {
 
 static void store3(Type *ty, char *dofs, char *dptr) {
   switch (ty->kind) {
+  case TY_WIDE_FN:
   case TY_ARRAY:
   case TY_STRUCT:
   case TY_UNION:
@@ -1273,6 +1298,25 @@ static void gen_cmp_zero(Node *node, NodeKind kind) {
   Node expr = {.kind = kind, .m.lhs = node, .m.rhs = &zero, .tok = node->tok};
   add_type(&expr);
   gen_expr(&expr);
+}
+
+static void gen_nested_capture(Obj *var, Token *tok) {
+  push();
+
+  Node src_v = {.kind = ND_VAR, .m.var = var->orig_var, .ty = var->ty, .tok = tok};
+  Node src_p = {.kind = ND_ADDR, .m.lhs = &src_v, .tok = tok};
+  add_type(&src_p);
+  gen_expr(&src_p);
+
+  char dofs[STRBUF_SZ];
+  snprintf(dofs, STRBUF_SZ, "%d", var->ofs);
+
+  char *dptr = pop_inreg(tmpreg64[0]);
+  if (var->capture_by_ref)
+    Printftn("mov %%rax, %s(%s)", dofs, dptr);
+  else
+    gen_mem_copy("0", "%rax", dofs, dptr, var->ty->size);
+  Printftn("mov %s, %%rax", dptr);
 }
 
 static void gen_var_assign(Obj *var, Node *expr) {
@@ -1552,7 +1596,7 @@ static ArgClass calc_class(ArgClass a, ArgClass b) {
 }
 
 static ArgClass get_class(Type *ty, int lo, int hi, int offset, ArgClass ac) {
-  if (ty->kind == TY_STRUCT || ty->kind == TY_UNION) {
+  if (ty->kind == TY_STRUCT || ty->kind == TY_UNION || ty->kind == TY_WIDE_FN) {
     for (Member *mem = ty->members; mem_iter(&mem); mem = mem->next) {
       int ofs = offset + mem->offset;
       if ((ofs + mem->ty->size) <= lo)
@@ -1636,6 +1680,7 @@ static int calling_convention(Obj *var, int *gp_count, int *fp_count, int *stack
     assert(ty->size != 0);
 
     switch (ty->kind) {
+    case TY_WIDE_FN:
     case TY_BITINT:
     case TY_STRUCT:
     case TY_UNION:
@@ -1852,6 +1897,7 @@ static void print_loc(Token *tok) {
 
 static void place_reg_arg(Type *ty, char *ofs, char *ptr, int *gp, int *fp) {
   switch (ty->kind) {
+  case TY_WIDE_FN:
   case TY_BITINT:
   case TY_STRUCT:
   case TY_UNION:
@@ -1883,6 +1929,9 @@ static void place_reg_arg(Type *ty, char *ofs, char *ptr, int *gp, int *fp) {
 
 // Logic should be in sync with prepare_funcall()
 static void gen_funcall_args(Node *node) {
+  if (node->call.cpt_ptr)
+    gen_var_assign(node->call.cpt_ptr, node->call.cpt_ptr->arg_expr);
+
   // Pass-by-stack or non-trival args that need spilling
   for (Obj *var = node->call.args; var; var = var->param_next)
     if (var->ptr)
@@ -1972,6 +2021,16 @@ static void gen_funcall(Node *node) {
   gen_funcall_args(node);
 
   Type *fnty = get_func_ty(node->call.expr);
+
+  if (node->call.cpt_ptr) {
+    Printftn("mov %d(%s), %%r10", node->call.cpt_ptr->ofs, node->call.cpt_ptr->ptr);
+    if (fnty->cpt_kind == CPT_CORO && node->kind == ND_CORO_INIT)
+      Printftn("movq $0, %"PRIi64"(%%r10)", fnty->cpt_ty->size - 8);
+    clobber_gp(5);
+  } else if (node->kind == ND_NESTED_SELFCALL) {
+    Printftn("mov -%d(%s), %%r10", ref_ptr_ofs, lvar_ptr);
+  }
+
   if (fnty->is_variadic || fnty->is_oldstyle) {
     if (fp_count)
       Printftn("movb $%d, %%al", fp_count);
@@ -1985,7 +2044,14 @@ static void gen_funcall(Node *node) {
     case 1: clobber_gp(1); break;  // %rdi
     default: clobber_gp(4); break;
     }
-    Printftn("call *%s", pop_inreg("%r10"));
+    if (node->kind == ND_WIDEFN_CALL) {
+      pop("%r11");
+      Printstn("mov 8(%%r11), %%r10");
+      Printstn("mov (%%r11), %%r11");
+      Printstn("call *%%r11");
+    } else {
+      Printftn("call *%s", pop_inreg("%r10"));
+    }
   } else {
     if (use_rip(node->call.expr->m.var))
       Printftn("call \"%s\"", get_symbol(node->call.expr->m.var));
@@ -2065,10 +2131,19 @@ static void gen_cond(Node *node, bool jump_cond, char *jump_label) {
     }
   }
 
-  if (node->kind == ND_FUNCALL && node->ty->kind == TY_BOOL)
-    gen_funcall(node);
-  else
+  switch (node->kind) {
+  case ND_CORO_INIT:
+  case ND_CORO_RESUME:
+  case ND_NESTED_SELFCALL:
+  case ND_WIDEFN_CALL:
+  case ND_FUNCALL:
+    if (node->ty->kind == TY_BOOL) {
+      gen_funcall(node);
+      break;
+    }
+  default:
     gen_expr(node);
+  }
   Printstn("test %%al, %%al");
   Printftn("j%s %s", (jump_cond ? "ne" : "e"), jump_label);
 }
@@ -2542,6 +2617,10 @@ static void gen_expr2(Node *node, bool is_void) {
   case ND_LOGOR:
     gen_logical(node, false);
     return;
+  case ND_CORO_INIT:
+  case ND_CORO_RESUME:
+  case ND_NESTED_SELFCALL:
+  case ND_WIDEFN_CALL:
   case ND_FUNCALL:
     gen_funcall(node);
 
@@ -2652,6 +2731,31 @@ static void gen_expr2(Node *node, bool is_void) {
       Printstn("movq (%%rax), %%rax");
     Printstn("movq 8(%%rax), %%rax");
     return;
+  case ND_NESTED_CTX: {
+    gen_addr(node->m.lhs);
+    Type *fn_ty = node->m.lhs->ty->cpt_fn_ty;
+    for (Obj *var = fn_ty->cpt_vars; var; var = var->next)
+      gen_nested_capture(var, node->tok);
+    return;
+  }
+  case ND_WIDEFN_INIT: {
+    gen_addr(node->m.target);
+    push();
+    gen_expr(node->m.lhs);
+    push();
+    gen_expr(node->m.rhs);
+
+    char *fn = pop_inreg(tmpreg64[0]);
+    char *dst = pop_inreg(tmpreg64[1]);
+    Printftn("mov %s, (%s)", fn, dst);
+    Printftn("mov %%rax, 8(%s)", dst);
+    return;
+  }
+  case ND_WIDEFN_PTR: {
+    gen_addr(node);
+    Printstn("mov (%%rax), %%rax");
+    return;
+  }
   case ND_VA_START: {
     gen_expr(node->m.lhs);
     Printftn("movl $%d, (%%rax)", va_gp_start);
@@ -2867,9 +2971,32 @@ static void gen_stmt(Node *node) {
   case ND_LABEL:
     Printfsn("%s:", node->lbl.unique_label);
     return;
+  case ND_CORO_YIELD: {
+    if (codegen_fn->is_noreturn)
+      error_tok(node->tok, "function is noreturn");
+    clobber_all_regs();
+    int64_t trap_label = coro_label;
+    coro_label = count();
+
+    Node n = *node;
+    n.kind = ND_RETURN;
+    gen_stmt(&n);
+
+    Printfsn(".L.coro.%"PRIi64":", coro_label);
+    coro_label = trap_label;
+    return;
+  }
   case ND_RETURN: {
     if (codegen_fn->is_noreturn)
       error_tok(node->tok, "function is noreturn");
+
+    if (node->m.lhs)
+      gen_expr(node->m.lhs);
+
+    if (codegen_fn->ty->cpt_kind == CPT_CORO) {
+      Printftn("lea .L.coro.%"PRIi64"(%%rip), %%rcx", coro_label);
+      Printstn("mov %%rcx, -8(%%rbx)");
+    }
 
     if (!node->m.lhs) {
       if (has_defr(node))
@@ -2877,10 +3004,10 @@ static void gen_stmt(Node *node) {
       Printftn("jmp .L.rtn.%"PRIi64, rtn_label);
       return;
     }
-    gen_expr(node->m.lhs);
+
     Type *ty = node->m.lhs->ty;
 
-    if (ty->kind == TY_STRUCT || ty->kind == TY_UNION || ty->kind == TY_BITINT) {
+    if (ty->kind == TY_STRUCT || ty->kind == TY_UNION || ty->kind == TY_BITINT || ty->kind == TY_WIDE_FN) {
       if (is_mem_class(ty)) {
         if (ty->kind == TY_BITINT)
           Printftn("lea %s(%s), %%rax", tmpbuf(ty->size), lvar_ptr);
@@ -3574,6 +3701,10 @@ static void gen_member_opt(Node *node, int64_t *ofs) {
   }
 
   switch (node->kind) {
+  case ND_CORO_INIT:
+  case ND_CORO_RESUME:
+  case ND_NESTED_SELFCALL:
+  case ND_WIDEFN_CALL:
   case ND_FUNCALL:
   case ND_ASSIGN:
   case ND_COND:
@@ -3769,7 +3900,6 @@ static bool gen_expr_opt(Node *node) {
 
   char *var_ptr;
   char var_ofs[STRBUF_SZ];
-
   {
     int64_t ival;
     if (is_gp_ty(ty) && is_const_expr(node, &ival)) {
@@ -3823,6 +3953,7 @@ static bool gen_expr_opt(Node *node) {
   }
 
   if (ty->kind == TY_ARRAY || ty->kind == TY_STRUCT || ty->kind == TY_UNION ||
+    ty->kind == TY_WIDE_FN ||
     is_bitfield(node)) {
     char var_ofs[STRBUF_SZ], *var_ptr;
     Node addr_node = {.kind = ND_ADDR, .m.lhs = node, .tok = node->tok};
@@ -5067,7 +5198,7 @@ void emit_text(Obj *fn) {
   int arg_stk_size = calling_convention(fn->ty->param_list, &gp_count, &fp_count, NULL);
 
   int lvar_align = get_lvar_align(fn->ty->scopes, 16);
-  lvar_ptr = (lvar_align > 16) ? rbx : rbp;
+  lvar_ptr = (lvar_align > 16 || fn->ty->cpt_kind == CPT_CORO) ? rbx : rbp;
   codegen_fn = fn;
   ext_refs = &(HashMap){0};
   rtn_label = count();
@@ -5079,6 +5210,11 @@ void emit_text(Obj *fn) {
     Printstn("push %%rbx");
     Printftn("and $-%d, %%rsp", lvar_align);
     Printstn("mov %%rsp, %%rbx");
+  } else if (fn->ty->cpt_kind == CPT_CORO) {
+    Printstn("push %%rbx");
+    Printstn("mov %%r10, %%rbx");
+
+    coro_label = count();
   }
 
   long stack_alloc_loc = resrvln();
@@ -5122,9 +5258,26 @@ void emit_text(Obj *fn) {
     Printftn("mov %%rsp, -%d(%s)", vla_base_ofs, lvar_ptr);
   }
 
+  if (fn->ty->cpt_kind == CPT_NESTED || fn->ty->cpt_kind == CPT_TYPE) {
+    ref_ptr_ofs = lvar_stk_sz += 8;
+    Printftn("mov %%r10, -%d(%s)", ref_ptr_ofs, lvar_ptr);
+  }
+
+  if (fn->ty->cpt_kind == CPT_CORO) {
+    assert(lvar_stk_sz == 0);
+    lvar_stk_sz = 8;
+  }
+
   if (rtn_by_stk) {
     rtn_ptr_ofs = lvar_stk_sz += 8;
     Printftn("mov %s, -%d(%s)", argreg64[0], rtn_ptr_ofs, lvar_ptr);
+  }
+
+  if (fn->ty->cpt_kind == CPT_CORO) {
+    Printstn("cmpq $0, -8(%%rbx)");
+    Printstn("je 1f");
+    Printstn("jmp *-8(%%rbx)");
+    Printstn("1:");
   }
 
   lvar_stk_sz = assign_lvar_offsets(fn->ty->scopes, lvar_stk_sz);
@@ -5139,6 +5292,7 @@ void emit_text(Obj *fn) {
     Type *ty = var->ty;
 
     switch (ty->kind) {
+    case TY_WIDE_FN:
     case TY_BITINT:
     case TY_STRUCT:
     case TY_UNION:
@@ -5172,7 +5326,7 @@ void emit_text(Obj *fn) {
   // Epilogue
   if (!(!is_reach && fn->is_noreturn)) {
     Printfsn(".L.rtn.%"PRIi64":", rtn_label);
-    if (lvar_align > 16)
+    if (lvar_align > 16 || fn->ty->cpt_kind == CPT_CORO)
       Printstn("mov -8(%%rbp), %%rbx");
     Printstn("leave");
     Printstn("ret");
@@ -5182,7 +5336,18 @@ void emit_text(Obj *fn) {
   peak_stk_usage += tmpbuf_sz;
   if (peak_stk_usage) {
     peak_stk_usage = align_to(peak_stk_usage, 16);
-    insrtln(".set __BUF, -%d; sub $%d, %%rsp", stack_alloc_loc, peak_stk_usage, peak_stk_usage);
+
+    if (fn->ty->cpt_kind == CPT_CORO)
+      insrtln(".set __BUF, -%d; add $%d, %%rbx", stack_alloc_loc, peak_stk_usage, peak_stk_usage);
+    else
+      insrtln(".set __BUF, -%d; sub $%d, %%rsp", stack_alloc_loc, peak_stk_usage, peak_stk_usage);
+  }
+
+  if (fn->ty->cpt_kind == CPT_CORO) {
+    fn->ty->cpt_ty->size = peak_stk_usage;
+    fn->ty->cpt_ty->align = lvar_align;
+    Printfsn(".L.coro.%"PRIi64":", coro_label);
+    Printstn("ud2");
   }
 
   Printftn(".size \"%s\", .-\"%s\"", fn_name, fn_name);

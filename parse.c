@@ -26,6 +26,7 @@ typedef struct {
   Type *enum_ty;
   int64_t enum_val;
   int32_t type_def_align;
+  bool is_uncaptured;
 } VarScope;
 
 typedef enum {
@@ -208,6 +209,8 @@ static Type *typename(Token **rest, Token *tok);
 static Type *typename2(Token **rest, Token *tok, VarAttr *attr);
 static Type *enum_specifier(Token **rest, Token *tok);
 static Type *typeof_specifier(Token **rest, Token *tok);
+static Type *ctxof_specifier(Token **rest, Token *tok);
+static Type *wideof_specifier(Token **rest, Token *tok);
 static Type *declarator(Token **rest, Token *tok, Type *ty, Token **name_tok);
 static Type *declarator2(Token **rest, Token *tok, Type *ty, Token **name_tok, DeclContext *ctx);
 static void list_initializer(Token **rest, Token *tok, Initializer *init, int i);
@@ -236,7 +239,7 @@ static Type *struct_union_decl(Token **rest, Token *tok, TypeKind kind);
 static Type *struct_decl(Type *ty, int alt_align, int pack_align);
 static Type *union_decl(Type *ty, int alt_align, int pack_align);
 static Node *postfix(Node *node, Token **rest, Token *tok);
-static Node *funcall(Token **rest, Token *tok, Node *node);
+static Node *funcall(Token **rest, Token *tok, Node *node, Node *ufcs_arg);
 static Node *unary(Token **rest, Token *tok);
 static Node *primary(Token **rest, Token *tok);
 static Node *parse_typedef(Token **rest, Token *tok, Type *basety, VarAttr *attr);
@@ -247,6 +250,7 @@ static int64_t const_expr2(Token **rest, Token *tok, Type **ty);
 static Node *new_node(NodeKind kind, Token *tok);
 static Node *resolve_local_gotos(void);
 static void push_goto(Node *node);
+static void func_definition(Token **rest, Token *tok, Obj *fn, Type *ty);
 
 static bool is_const_context(void) {
   return fnctx ? fnctx->is_static_init_context : !scope->parent;
@@ -259,10 +263,11 @@ static void enter_scope(void) {
   scope = scope->children = sc;
 }
 
-static void enter_param_scope(void) {
+static Scope *new_param_scope(Scope *parent) {
   Scope *sc = ast_arena_calloc(sizeof(Scope));
-  sc->parent = scope;
-  scope = sc;
+  sc->is_fnbase = true;
+  sc->parent = parent;
+  return sc;
 }
 
 static void enter_tmp_scope(void) {
@@ -307,8 +312,10 @@ static Node *leave_stmt_scope(DeferStmt *defr, Node *stmt_node) {
 
 static Scope *base_scope(void) {
   Scope *sc = scope;
-  while (sc->parent && sc->parent->parent)
+  while (sc && !sc->is_fnbase)
     sc = sc->parent;
+  if (!sc)
+    internal_error();
   return sc;
 }
 
@@ -323,8 +330,11 @@ static Scope *decl_scope(void) {
 static VarScope *find_var(Token *tok) {
   for (Scope *sc = scope; sc; sc = sc->parent) {
     VarScope *sc2 = hashmap_get2(&sc->vars, tok->loc, tok->len);
-    if (sc2)
+    if (sc2) {
+      if (sc2->is_uncaptured)
+        error_tok(tok, "identifier is uncaptured");
       return sc2;
+    }
   }
   return NULL;
 }
@@ -865,6 +875,7 @@ static void attr_cleanup(Token *loc, TokenKind kind, Obj **fn) {
       if (!(sc && sc->var && sc->var->ty->kind == TY_FUNC))
         error_tok(tok, "cleanup function not found");
       *fn = sc->var;
+      sc->var->is_searched = true;
       return;
     }
   }
@@ -1151,6 +1162,8 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr, StorageClass ctx)
       case TK_enum: ty = enum_specifier(&tok, tok); break;
       case TK_typeof: ty = typeof_specifier(&tok, tok); break;
       case TK_typeof_unqual: ty = unqual(typeof_specifier(&tok, tok)); break;
+      case TK_ctxof: ty = ctxof_specifier(&tok, tok); break;
+      case TK_wideof: ty = wideof_specifier(&tok, tok); break;
       case TK_auto_type: ty = new_type(TY_AUTO, -1, 0); break;
       }
       if (ty) {
@@ -1245,6 +1258,168 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr, StorageClass ctx)
   return qual_type(qual, ty);
 }
 
+static bool need_capture(Obj *var) {
+  return var->is_local || var->capture_by_ref || var->capture_by_val;
+}
+
+static Obj *capture_var2(Obj *cpt_var, bool by_ref, Token *tok) {
+  if (!need_capture(cpt_var))
+    return cpt_var;
+  if (tok && is_vm_ty(cpt_var->ty))
+    error_tok(tok, "vm type cannot be captrued");
+  Obj *var = alloc_ast_var(cpt_var->ty);
+  var->orig_var = cpt_var;
+  if (by_ref)
+    var->capture_by_ref = true;
+  else
+    var->capture_by_val = true;
+  return var;
+}
+
+static VarScope *capture_var(Token *tok, bool by_ref) {
+  VarScope *sc = find_var(tok);
+  if (!sc || !sc->var)
+    error_tok(tok, "not a variable");
+  VarScope *sc2 = ast_arena_calloc(sizeof(VarScope));
+  sc2->var = capture_var2(sc->var, by_ref, tok);
+  return sc2;
+}
+
+static void capture_list(Token **rest, Token *tok, Scope *sc, bool *all_ref, bool *all_val) {
+  Token *start = tok;
+  for (; comma_list(rest, &tok, "}", tok != start); tok = tok->next) {
+    if (equal(tok, "&") && tok->next->kind == TK_IDENT) {
+      tok = tok->next;
+      hashmap_put2(&sc->vars, tok->loc, tok->len, capture_var(tok, true));
+      continue;
+    }
+    if (tok->kind == TK_IDENT) {
+      hashmap_put2(&sc->vars, tok->loc, tok->len, capture_var(tok, false));
+      continue;
+    }
+    if (start == tok) {
+      if (equal(tok, "&")) {
+        *all_ref = true;
+        continue;
+      }
+      if (equal(tok, "=")) {
+        *all_val = true;
+        continue;
+      }
+    }
+    error_tok(tok, "unknown capture");
+  }
+}
+
+static Scope *default_capture(Type *fn_ty, bool all_ref, bool all_val) {
+  Obj head = {0};
+  Obj *cur = &head;
+  for (int32_t i = 0; i < fn_ty->scopes->vars.capacity; i++) {
+    VarScope *vsc = fn_ty->scopes->vars.buckets[i].val;
+    if (vsc && vsc->var)
+      cur = cur->next = vsc->var;
+  }
+
+  Scope *sc = ast_arena_calloc(sizeof(Scope));
+  for (Scope *s = scope; s; s = s->parent)
+    sc->parent = s;
+
+  for (Scope *s = scope; s->parent; s = s->parent) {
+    hashmap_merge_no_shadow(&sc->vars, &s->vars);
+    hashmap_merge_no_shadow(&sc->tags, &s->tags);
+  }
+
+  for (int32_t i = 0; i < sc->vars.capacity; i++) {
+    VarScope *vsc = sc->vars.buckets[i].val;
+    if (!vsc)
+      continue;
+    if (vsc->var) {
+      if (need_capture(vsc->var)) {
+        VarScope *vsc2 = ast_arena_calloc(sizeof(VarScope));
+        sc->vars.buckets[i].val = vsc2;
+
+        if ((all_ref || all_val) && !is_vm_ty(vsc->var->ty)) {
+          vsc2->var = capture_var2(vsc->var, all_ref, NULL);
+          cur = cur->next = vsc2->var;
+        } else {
+          vsc2->is_uncaptured = true;
+        }
+      }
+    } else if (vsc->type_def) {
+      if (is_vm_ty(vsc->type_def)) {
+        VarScope *vsc2 = ast_arena_calloc(sizeof(VarScope));
+        sc->vars.buckets[i].val = vsc2;
+        vsc2->is_uncaptured = true;
+      }
+    }
+  }
+  fn_ty->cpt_vars = head.next;
+  return sc;
+}
+
+static void capture_member2(HashMap *map, Member *mem, int32_t ofs, QualMask q) {
+  if (mem->is_bitfield)
+    error_tok(mem->name, "capture bitfields unimplemented");
+  VarScope *vsc = ast_arena_calloc(sizeof(VarScope));
+  vsc->var = alloc_ast_var(qual_type(q, mem->ty));
+  vsc->var->capture_by_val = true;
+  vsc->var->ofs = ofs;
+  hashmap_put2(map, mem->name->loc, mem->name->len, vsc);
+}
+
+static void capture_member(HashMap *map, Member *members, int32_t ofs, QualMask q) {
+  for (Member *mem = members; mem; mem = mem->next) {
+    if (mem->name)
+      capture_member2(map, mem, ofs + mem->offset, q);
+    else if (mem->ty->kind == TY_STRUCT || mem->ty->kind == TY_UNION)
+      capture_member(map, mem->ty->members, ofs + mem->offset, q);
+  }
+}
+
+static void capture_type(Token **rest, Token *tok, Type *fn_ty, bool non_cpt) {
+  if (consume(&tok, tok, "%")) {
+    if (scope->parent)
+      error_tok(tok, "not in file scope");
+    fn_ty->cpt_kind = CPT_CORO;
+    fn_ty->cpt_ty = new_type(TY_NESTED_CONTEXT, -1, 1);
+    *rest = skip(tok, "}");
+    return;
+  }
+  if (non_cpt) {
+    if (!scope->parent)
+      error_tok(tok, "not in function scope");
+    fn_ty->scopes = new_param_scope(NULL);
+    fn_ty->scopes->parent = default_capture(fn_ty, false, false);
+    return;
+  }
+  if (is_typename(tok)) {
+    fn_ty->cpt_kind = CPT_TYPE;
+    Type *cpt_ty = declspec(&tok, tok, &(VarAttr){0}, 0);
+    if (cpt_ty->size < 0 || !(cpt_ty->kind == TY_STRUCT || cpt_ty->kind == TY_UNION))
+      error_tok(tok, "expected complete struct type");
+    fn_ty->cpt_ty = cpt_ty;
+    fn_ty->scopes = new_param_scope(scope);
+    capture_member(&fn_ty->scopes->vars, cpt_ty->members, 0, cpt_ty->qual);
+    *rest = skip(tok, "}");
+    return;
+  }
+  if (equal(tok, "&") || equal(tok, "=") || tok->kind == TK_IDENT) {
+    if (!scope->parent)
+      error_tok(tok, "not in function scope");
+    fn_ty->cpt_kind = CPT_NESTED;
+    fn_ty->cpt_ty = new_type(TY_NESTED_CONTEXT, -1, 1);
+
+    fn_ty->scopes = new_param_scope(NULL);
+
+    bool all_ref = false;
+    bool all_val = false;
+    capture_list(rest, tok, fn_ty->scopes, &all_ref, &all_val);
+    fn_ty->scopes->parent = default_capture(fn_ty, all_ref, all_val);
+    return;
+  }
+  error_tok(tok, "unknown capture");
+}
+
 static Type *func_params(Token **rest, Token *tok, Type *rtn_ty, Token **end) {
   Type *fn_ty = func_type(rtn_ty, tok);
 
@@ -1262,7 +1437,7 @@ static Type *func_params(Token **rest, Token *tok, Type *rtn_ty, Token **end) {
   }
   bool is_def = end && is_func_def(*end ? *end : skip_paren(tok));
 
-  if (!is_typename(tok)) {
+  if (!is_typename(tok) && !equal(tok, "{")) {
     fn_ty->is_oldstyle = true;
 
     Token *start = tok;
@@ -1270,8 +1445,7 @@ static Type *func_params(Token **rest, Token *tok, Type *rtn_ty, Token **end) {
       while (comma_list(rest, &tok, ")", tok != start))
         ident_tok(&tok, tok);
     } else {
-      enter_param_scope();
-      fn_ty->scopes = scope;
+      scope = fn_ty->scopes = new_param_scope(scope);
 
       Obj head = {0};
       Obj *cur = &head;
@@ -1285,8 +1459,25 @@ static Type *func_params(Token **rest, Token *tok, Type *rtn_ty, Token **end) {
     return fn_ty;
   }
 
-  enter_param_scope();
-  fn_ty->scopes = scope;
+  if (consume(&tok, tok, "{")) {
+    if (!is_def)
+      error_tok(tok, "capture functions cannot be forward declared");
+
+    capture_type(&tok, tok, fn_ty, false);
+
+    if (consume(rest, tok, ")"))
+      return fn_ty;
+
+    tok = skip(tok, ",");
+  } else if (is_def && scope->parent) {
+    capture_type(&tok, tok, fn_ty, true);
+  }
+
+  if (!fn_ty->scopes)
+    fn_ty->scopes = new_param_scope(scope);
+
+  Scope *prv_sc = scope;
+  scope = fn_ty->scopes;
 
   Obj head = {0};
   Obj *cur = &head;
@@ -1294,6 +1485,8 @@ static Type *func_params(Token **rest, Token *tok, Type *rtn_ty, Token **end) {
 
   while (comma_list(rest, &tok, ")", cur != &head)) {
     if (equal(tok, "...")) {
+      if (fn_ty->cpt_kind == CPT_CORO)
+        error_tok(tok, "coroutine cannot be variadic");
       fn_ty->is_variadic = true;
       *rest = skip(tok->next, ")");
       break;
@@ -1318,7 +1511,7 @@ static Type *func_params(Token **rest, Token *tok, Type *rtn_ty, Token **end) {
   }
   fn_ty->pre_calc = expr;
   fn_ty->param_list = head.param_next;
-  leave_scope();
+  scope = prv_sc;
   return fn_ty;
 }
 
@@ -1690,6 +1883,56 @@ static Type *typeof_specifier(Token **rest, Token *tok) {
   return ty;
 }
 
+static Type *ctxof_specifier(Token **rest, Token *tok) {
+  tok = skip(tok, "(");
+
+  Type *ty;
+  if (is_typename(tok)) {
+    ty = typename(&tok, tok);
+  } else {
+    Node *node = expr(&tok, tok);
+    add_type(node);
+    ty = node->ty;
+  }
+  *rest = skip(tok, ")");
+
+  if (ty->cpt_kind == CPT_NONE || !ty->cpt_ty)
+    error_tok(tok, "not a defined capture function");
+  return ty->cpt_ty;
+}
+
+static Type *get_non_capture(Type *ty) {
+  if (ty->cpt_kind != CPT_NONE) {
+    ty = copy_type(ty);
+    ty->cpt_kind = CPT_NONE;
+    ty->cpt_ty = NULL;
+    ty->cpt_vars = NULL;
+  }
+  return ty;
+}
+
+static Type *wideof_specifier(Token **rest, Token *tok) {
+  tok = skip(tok, "(");
+
+  Type *ty;
+  if (is_typename(tok)) {
+    ty = typename(&tok, tok);
+  } else {
+    Node *node = expr(&tok, tok);
+    add_type(node);
+    ty = node->ty;
+  }
+  *rest = skip(tok, ")");
+
+  if (ty->kind != TY_FUNC)
+    error_tok(tok, "not a function");
+  ty = get_non_capture(ty);
+
+  Type *ty2 = new_type(TY_WIDE_FN, 16, 8);
+  ty2->cpt_fn_ty = ty;
+  return ty2;
+}
+
 static Node *vla_count(Type *ty, Token *tok, bool is_void) {
   if (!ty->vla_len)
     return is_void ? NULL : new_size_t(ty->array_len, tok);
@@ -1729,10 +1972,7 @@ static Node *calc_vla(Type *ty, Token *tok) {
   return n;
 }
 
-static Node *declaration2(Token **rest, Token *tok, Type *basety, VarAttr *attr, Obj **cond_var) {
-  Token *name = NULL;
-  Type *ty = declarator(&tok, tok, basety, &name);
-
+static Node *declaration3(Token **rest, Token *tok, Token *name, Type *ty, VarAttr *attr, Obj **cond_var) {
   if (ty->kind == TY_FUNC) {
     if (!name)
       error_tok(tok, "function name omitted");
@@ -1778,6 +2018,8 @@ static Node *declaration2(Token **rest, Token *tok, Type *basety, VarAttr *attr,
   push_var_name(name, var);
 
   if (ty->kind == TY_VLA) {
+    if (fnctx->fn->ty->cpt_kind == CPT_CORO)
+      error_tok(tok, "VLA not supported in coroutine");
     fnctx->use_vla = true;
 
     Node *node = vla_size(ty, name);
@@ -1825,6 +2067,12 @@ static Node *declaration2(Token **rest, Token *tok, Type *basety, VarAttr *attr,
   return expr;
 }
 
+static Node *declaration2(Token **rest, Token *tok, Type *basety, VarAttr *attr, Obj **cond_var) {
+  Token *name = NULL;
+  Type *ty = declarator(&tok, tok, basety, &name);
+  return declaration3(rest, tok, name, ty, attr, cond_var);
+}
+
 static Node *cond_declaration(Token **rest, Token *tok, char *stopper, int clause) {
   Node *n = NULL;
   Obj *var = NULL;
@@ -1866,8 +2114,33 @@ static Node *declaration(Token **rest, Token *tok) {
     return parse_typedef(rest, tok, basety, &attr);
 
   Node *expr = NULL;
-  for (bool first = true; comma_list(rest, &tok, ";", !first); first = false)
-    chain_expr(&expr, declaration2(&tok, tok, basety, &attr, &(Obj *){0}));
+  for (bool first = true; comma_list(rest, &tok, ";", !first); first = false) {
+    Token *name = NULL;
+    Type *ty = declarator(&tok, tok, basety, &name);
+
+    if (first && ty->kind == TY_FUNC && equal(tok, "{")) {
+      if (!name)
+        error_tok(tok, "function name omitted");
+      char *symb = new_unique_name();
+      HashEntry *ent = hashmap_get_or_insert(&symbols, symb, strlen(symb));
+      Obj *fn = ent->val = new_gvar(symb, ty);
+      fn->asm_name = symb;
+      fn->is_static = true;
+      push_gvar_name(name, fn);
+
+      if (ty->cpt_kind == CPT_NESTED) {
+        VarScope *vsc = ast_arena_calloc(sizeof(VarScope));
+        vsc->var = fn;
+        hashmap_put2(&ty->scopes->parent->vars, name->loc, name->len, vsc);
+      }
+      aligned_attr(name, tok, &attr, &fn->alt_align);
+      func_attr(name, tok, &attr, fn, true);
+      func_definition(rest, tok, fn, ty);
+      return expr;
+    }
+
+    chain_expr(&expr, declaration3(&tok, tok, name, ty, &attr, &(Obj *){0}));
+  }
   return expr;
 }
 
@@ -2830,12 +3103,19 @@ static JumpContext *resolve_labeled_jump(Token **rest, Token *tok, bool is_cont)
 }
 
 static Node *stmt(Token **rest, Token *tok, Token *label_list) {
-  if (tok->kind == TK_return) {
+  if (tok->kind == TK_return || tok->kind == TK_yield) {
     if (fnctx->defr_ctx)
       error_tok(tok, "return in defer block");
 
-    Node *node = new_node(ND_RETURN, tok);
-    node->dfr_from = fnctx->defr;
+    Node *node;
+    if (tok->kind == TK_return) {
+      node = new_node(ND_RETURN, tok);
+      node->dfr_from = fnctx->defr;
+    } else {
+      if (fnctx->fn->ty->cpt_kind != CPT_CORO)
+        error_tok(tok, "not in a coroutine");
+      node = new_node(ND_CORO_YIELD, tok);
+    }
     if (consume(rest, tok->next, ";"))
       return node;
 
@@ -4724,7 +5004,7 @@ static Node *new_inc_dec(Node *node, Token *tok, int addend) {
 static Node *postfix(Node *node, Token **rest, Token *tok) {
   for (;;) {
     if (equal(tok, "(")) {
-      node = funcall(&tok, tok->next, node);
+      node = funcall(&tok, tok->next, node, NULL);
       continue;
     }
 
@@ -4740,6 +5020,17 @@ static Node *postfix(Node *node, Token **rest, Token *tok) {
 
       if (is_array(ty))
         apply_cv_qualifier(node, ty);
+      continue;
+    }
+
+    if (equal(tok, ".") && consume(&tok, tok->next, ".")) {
+      VarScope *vsc = find_var(tok);
+      if (!vsc || !vsc->var || vsc->var->ty->cpt_kind == CPT_NONE)
+        error_tok(tok, "expected function with capture");
+      add_type(node);
+      if (!is_compatible(node->ty, vsc->var->ty->cpt_ty))
+        error_tok(tok, "incompatible capture type");
+      node = funcall(&tok, skip(tok->next, "("), new_var_node(vsc->var, tok), node);
       continue;
     }
 
@@ -4779,19 +5070,82 @@ static Node *postfix(Node *node, Token **rest, Token *tok) {
   }
 }
 
+static void chk_capture_arg(Type *fn_ty, Node *arg) {
+  add_type(arg);
+
+  if (!fn_ty->cpt_ty || arg->ty->kind != TY_PTR ||
+    (arg->ty->base->qual & Q_CONST) ||
+    !(is_compatible(fn_ty->cpt_ty, arg->ty->base) || arg->ty->base->kind == TY_VOID))
+    error_tok(arg->tok, "invalid capture argument");
+}
+
+static NodeKind funcall_capture2(Token **rest, Token *tok) {
+  if (consume(&tok, tok, "...")) {
+    skip(tok, ")");
+    *rest = tok;
+    return ND_CORO_RESUME;
+  }
+  return ND_CORO_INIT;
+}
+
+static NodeKind funcall_capture(Token **rest, Token *tok, Node *fn, Obj **cpt_ptr, Node *ufcs_arg) {
+  if (fn->ty->kind == TY_WIDE_FN)
+    return ND_WIDEFN_CALL;
+
+  if (fn->ty->cpt_kind == CPT_NONE)
+    return ND_FUNCALL;
+
+  if (ufcs_arg) {
+    *cpt_ptr = new_lvar(pointer_to(ty_void));
+    (*cpt_ptr)->arg_expr = new_unary(ND_ADDR, ufcs_arg, tok);
+
+    if (fn->ty->cpt_kind == CPT_CORO)
+      return funcall_capture2(rest, tok);
+    return ND_FUNCALL;
+  }
+
+  tok = skip(tok, "{");
+
+  if (fn->ty->cpt_kind == CPT_NESTED && fn->kind == ND_VAR &&
+    fn->m.var == fnctx->fn && consume(&tok, tok, "}")) {
+    if (!equal(tok, ")"))
+      tok = skip(tok, ",");
+    *rest = tok;
+    return ND_NESTED_SELFCALL;
+  }
+
+  Node *arg = assign(&tok, tok);
+  chk_capture_arg(fn->ty, arg);
+
+  *cpt_ptr = new_lvar(pointer_to(ty_void));
+  (*cpt_ptr)->arg_expr = arg;
+
+  tok = skip(tok, "}");
+  if (!equal(tok, ")"))
+    tok = skip(tok, ",");
+  *rest = tok;
+
+  if (fn->ty->cpt_kind == CPT_CORO)
+    return funcall_capture2(rest, tok);
+  return ND_FUNCALL;
+}
+
 // funcall = (assign ("," assign)*)? ")"
-static Node *funcall(Token **rest, Token *tok, Node *fn) {
+static Node *funcall(Token **rest, Token *tok, Node *fn, Node *ufcs_arg) {
   Type *ty = get_func_ty(fn);
 
   if (fn->kind == ND_VAR && fn->m.var->returns_twice)
     fnctx->fn->dont_reuse_stk = true;
 
+  enter_tmp_scope();
+
+  Obj *cpt_ptr = NULL;
+  NodeKind kind = funcall_capture(&tok, tok, fn, &cpt_ptr, ufcs_arg);
+
   Obj *param = ty->is_oldstyle ? NULL : ty->param_list;
 
   Obj head = {0};
   Obj *cur = &head;
-
-  enter_tmp_scope();
 
   while (comma_list(rest, &tok, ")", cur != &head)) {
     Node *arg = assign(&tok, tok);
@@ -4814,13 +5168,14 @@ static Node *funcall(Token **rest, Token *tok, Node *fn) {
     cur = cur->param_next = alloc_ast_var(arg->ty);
     cur->arg_expr = arg;
   }
-  if (param)
+  if (param && kind == ND_FUNCALL)
     error_tok(tok, "too few arguments");
 
-  Node *node = new_node(ND_FUNCALL, tok);
+  Node *node = new_node(kind, tok);
   node->call.expr = fn;
   node->ty = ty->return_ty;
   node->call.args = head.param_next;
+  node->call.cpt_ptr = cpt_ptr;
 
   prepare_funcall(node, scope);
   leave_scope();
@@ -4828,6 +5183,7 @@ static Node *funcall(Token **rest, Token *tok, Node *fn) {
   // If a function returns a struct, it is caller's responsibility
   // to allocate a space for the return value.
   if (node->ty->kind == TY_STRUCT || node->ty->kind == TY_UNION ||
+    node->ty->kind == TY_WIDE_FN ||
     (node->ty->kind == TY_BITINT && bitint_rtn_need_copy(node->ty->bit_cnt)))
     node->call.rtn_buf = new_lvar(node->ty);
   return node;
@@ -5151,6 +5507,56 @@ static Node *builtin_functions(Token **rest, Token *tok) {
     return node;
   }
 
+  if (equal(tok, "__builtin_capture_init")) {
+    Node *node = new_node(ND_NESTED_CTX, tok);
+    tok = skip(tok->next, "(");
+    node->m.lhs = conditional(&tok, tok);
+    add_type(node->m.lhs);
+
+    Type *cpt_ty = node->m.lhs->ty;
+    if (!cpt_ty->cpt_fn_ty || !cpt_ty->cpt_fn_ty->cpt_vars)
+      error_tok(tok, "expected context of nested function");
+
+    *rest = skip(tok, ")");
+    node->ty = ty_void;
+    return node;
+  }
+
+  if (equal(tok, "__builtin_widefn_create")) {
+    Node *node = new_node(ND_WIDEFN_INIT, tok);
+    tok = skip(tok->next, "(");
+    node->m.target = conditional(&tok, tok);
+    tok = skip(tok, ",");
+    node->m.lhs = conditional(&tok, tok);
+    tok = skip(tok, ",");
+    node->m.rhs = conditional(&tok, tok);
+    *rest = skip(tok, ")");
+
+    add_type(node->m.target);
+    if (node->m.target->ty->kind != TY_WIDE_FN)
+      error_tok(node->m.target->tok, "not a wide function object");
+    Type *fn_ty = get_func_ty(node->m.lhs);
+    if (!is_compatible(get_non_capture(fn_ty), node->m.target->ty->cpt_fn_ty))
+      error_tok(node->m.lhs->tok, "function type mismatch");
+    if (fn_ty->cpt_kind != CPT_NONE)
+      chk_capture_arg(fn_ty, node->m.rhs);
+    node->ty = ty_void;
+    return node;
+  }
+
+  if (equal(tok, "__builtin_widefn_get_ctx")) {
+    Node *node = new_node(ND_WIDEFN_PTR, tok);
+    tok = skip(tok->next, "(");
+    node->m.lhs = conditional(&tok, tok);
+    *rest = skip(tok, ")");
+
+    add_type(node->m.lhs);
+    if (node->m.lhs->ty->kind != TY_WIDE_FN)
+      error_tok(node->m.target->tok, "not a wide function object");
+    node->ty = pointer_to(ty_void);
+    return node;
+  }
+
   if (equal(tok, "__builtin_compare_and_swap")) {
     Node *node = new_node(ND_CAS, tok);
     tok = skip(tok->next, "(");
@@ -5229,10 +5635,11 @@ static Node *primary(Token **rest, Token *tok) {
     // Variable or enum constant
     VarScope *sc = find_var(tok);
     *rest = tok->next;
-
     if (sc) {
-      if (sc->var)
+      if (sc->var) {
+        sc->var->is_searched = true;
         return new_var_node(sc->var, tok);
+      }
       if (sc->enum_ty) {
         Node *n = new_num(sc->enum_val, tok);
         n->ty = (sc->enum_ty->is_int_enum) ? ty_int : sc->enum_ty;
@@ -5296,7 +5703,6 @@ static Node *primary(Token **rest, Token *tok) {
     *rest = tok->next;
     return new_var_node(fnctx->fnname, tok);
   }
-
   error_tok(tok, "expected an expression");
 }
 
@@ -5515,8 +5921,8 @@ static void func_definition(Token **rest, Token *tok, Obj *fn, Type *ty) {
   Type *prot_ty = fn->ty;
   fn->ty = ty;
 
-  arena_on(&ast_arena);
-
+  Scope *prv_sc = scope;
+  FuncContext *prv_fnctx = fnctx;
   fnctx = &(FuncContext){.fn = fn};
 
   Node *precalc = NULL;
@@ -5532,9 +5938,10 @@ static void func_definition(Token **rest, Token *tok, Obj *fn, Type *ty) {
         if (var->ty->size <= 0)
           error_tok(tok, "incomplete parameter type");
     }
+    if (!scope->parent)
+      error_tok(tok, "wtf2");
   } else {
-    enter_scope();
-    ty->scopes = scope;
+    scope = ty->scopes = new_param_scope(scope);
   }
 
   fn->body = compound_stmt2(rest, tok, ND_BLOCK);
@@ -5553,10 +5960,33 @@ static void func_definition(Token **rest, Token *tok, Obj *fn, Type *ty) {
   if (fnctx->gotos)
     resolve_gotos();
 
+  if (ty->cpt_kind == CPT_NESTED) {
+    Obj head = {0};
+    Obj *cur = &head;
+    int32_t ofs = 0, max_align = 1;
+    for (Obj *var = ty->cpt_vars; var; var = var->next) {
+      if (!var->is_searched)
+        continue;
+      int32_t sz = var->capture_by_ref ? ty_ptrdiff_t->size : var->ty->size;
+      int32_t ali = var->capture_by_ref ? ty_ptrdiff_t->align : get_align(var);
+      ofs = var->ofs = align_to(ofs, ali);
+      ofs += sz;
+      max_align = MAX(max_align, ali);
+      cur = cur->next = var;
+    }
+    if (cur == &head)
+      error_tok(tok, "nothing captured");
+    cur->next = NULL;
+    ty->cpt_vars = head.next;
+    ty->cpt_ty->cpt_fn_ty = ty; // circular ref
+    ty->cpt_ty->size = ofs;
+    ty->cpt_ty->align = max_align;
+  }
+
   emit_text(fn);
 
-  fnctx = NULL;
-  arena_off(&ast_arena);
+  fnctx = prv_fnctx;
+  scope = prv_sc;
 }
 
 static void global_declaration(Token **rest, Token *tok, Type *basety, VarAttr *attr) {
@@ -5577,7 +6007,9 @@ static void global_declaration(Token **rest, Token *tok, Type *basety, VarAttr *
 
       if (first && !scope->parent && is_func_def(tok)) {
         func_attr(name, tok, attr, fn, true);
+        arena_on(&ast_arena);
         func_definition(rest, tok, fn, ty);
+        arena_off(&ast_arena);
         return;
       }
       func_attr(name, tok, attr, fn, false);

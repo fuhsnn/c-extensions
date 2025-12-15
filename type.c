@@ -414,8 +414,12 @@ bool is_compatible(Type *t1, Type *t2) {
     return true;
   case TY_PTR:
     return is_compatible2(t1->base, t2->base);
+  case TY_WIDE_FN:
+    return is_compatible(t1->cpt_fn_ty, t2->cpt_fn_ty);
   case TY_FUNC: {
     if (!is_compatible(t1->return_ty, t2->return_ty))
+      return false;
+    if (t1->cpt_kind || t2->cpt_kind)
       return false;
     if (t1->is_oldstyle || t2->is_oldstyle)
       return true;
@@ -488,6 +492,8 @@ Type *get_func_ty(Node *node) {
     return ty;
   if (ty->kind == TY_PTR && ty->base->kind == TY_FUNC)
     return ty->base;
+  if (ty->kind == TY_WIDE_FN)
+    return ty->cpt_fn_ty;
   error_tok(node->tok, "not a function");
 }
 
