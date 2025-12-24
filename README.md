@@ -18,6 +18,8 @@ Examples may need `-std=c23` to build because slimcc hasn't default to that.
 <a name="extended-capture"></a>
 ## Extended capture functions
 
+[implementation branch](https://github.com/fuhsnn/c-extensions/tree/extended-capture)
+
 I got nerd-sniped with WG14 [closure propoasl](https://www.open-std.org/jtc1/sc22/wg14/www/docs/n3694.htm) and made this alternative version with additional catpure types, unified syntax and explicit call syntax.
 
 It's built around a {*capture*} clause before a function's parameter-list:
@@ -155,6 +157,8 @@ More examples can befound in [the branch](https://github.com/fuhsnn/c-extensions
 <a name="compat-ident"></a>
 ## Compatibility identifiers
 
+[implementation branch](https://github.com/fuhsnn/c-extensions/tree/compat-ident)
+
 It's a common idiom to do generic types with macros like:
 ```C
 #define span(T) struct span_##T { ssize_t N; T* data; }
@@ -213,6 +217,8 @@ int main(void) {
 <a name="alt-named-loops-syntax"></a>
 ## Alternative C2Y named loops syntax
 
+[implementation branch](https://github.com/fuhsnn/c-extensions/tree/alt-named-loops-syntax)
+
 An implementation of the [n3377 proposal to WG14](https://www.open-std.org/jtc1/sc22/wg14/www/docs/n3377.pdf) because I'm sympathetic to it.
 
 It's done on top of the label-based syntax, so those still work. `do while` loops are implemented differently because slimcc's current structure is too single-pass-y to support it elegantly, the name is positioned after `do` and only work for curly braced blocks.
@@ -249,6 +255,8 @@ int main(void) {
 
 <a name="attr-gate"></a>
 ## Block attribute `[[gate(allowlist)]]`
+
+[implementation branch](https://github.com/fuhsnn/c-extensions/tree/attr-gate)
 
 The attribute act as a guarded gate that only allow identifiers listed in `allowlist` to be referenced from inside the following block. It can be applied to normal blocks, secondary-blocks, statement-expressions as well as function bodies.
 ```C
@@ -318,6 +326,8 @@ int main(void) {
 <a name="match-type"></a>
 ## `_Match_type(type/expr, type:(expr), ...)`
 
+[implementation branch](https://github.com/fuhsnn/c-extensions/tree/match-type-int)
+
 As a response to Simon Tatham's [Workarounds for C11 _Generic](https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/c11-generic/), this is a version of `_Generic` that chooses from parentheses-balanced tokens without semantic checking until the selection is made. The result still needs to be a complete expression, more complex stuff can be done with statement-expression.
 
 Runnable example:
@@ -348,6 +358,8 @@ int main() {
 
 <a name="match-int"></a>
 ## `_Match_int(const_expr, const_expr:(expr), ...)`
+
+[implementation branch](https://github.com/fuhsnn/c-extensions/tree/match-type-int)
 
 Like `_Match_type` but chooses from integer constant expressions instead, in other words, compile-time expression selection with pattern-matching syntax. It also tries to be less sloppy by requiring case numbers to be the same integer type without implicit conversion.
 
