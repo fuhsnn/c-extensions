@@ -1,5 +1,9 @@
-This is a collection of extensions to C programming language implemented as patches to the [slimcc](https://github.com/fuhsnn/slimcc) compiler, done mostly for fun, may not be well thought out. They're kept in [separate branches](https://github.com/fuhsnn/c-extensions/branches) for better view-ability and to keep upstream codebase flexible. For building the compiler please refer to [upstream readme](https://github.com/fuhsnn/slimcc?tab=readme-ov-file#building-and-using). Examples may need `-std=c23` to build because slimcc hasn't default to that.
+This is a collection of extensions to C programming language implemented as patches to the [slimcc](https://github.com/fuhsnn/slimcc) compiler, done mostly for fun, may not be well thought out. They're kept in [separate branches](https://github.com/fuhsnn/c-extensions/branches) for better view-ability and to keep upstream codebase flexible. For building the compiler please refer to [upstream readme](https://github.com/fuhsnn/slimcc?tab=readme-ov-file#building-and-using).
 
+Examples may need `-std=c23` to build because slimcc hasn't default to that.
+
+ - `int fn({...}, ...)` [doc](#extended-capture) / [branch](https://github.com/fuhsnn/c-extensions/tree/extended-capture)
+ - - Closures, coroutines and member functions in a unified declaration syntax plus UFCS.
  - `struct _Compat(ident) {...}` [doc](#compat-ident) / [branch](https://github.com/fuhsnn/c-extensions/tree/compat-ident)
  - - Make macro'd container types compatible without token pasting
  - `for LoopName (...)` [doc](#alt-named-loops-syntax) / [branch](https://github.com/fuhsnn/c-extensions/tree/alt-named-loops-syntax)
@@ -10,6 +14,143 @@ This is a collection of extensions to C programming language implemented as patc
  - - _Generic without semantic checking inactive branches
  - `_Match_int()` [doc](#match-int) / [branch](https://github.com/fuhsnn/c-extensions/tree/match-type-int)
  - - Compile time expression matching
+
+<a name="extended-capture"></a>
+## Extended capture functions
+
+I got nerd-sniped with WG14 [closure propoasl](https://www.open-std.org/jtc1/sc22/wg14/www/docs/n3694.htm) and made this alternative version with additional catpure types, unified syntax and explicit call syntax.
+
+It's built around a {*capture*} clause before a function's parameter-list:
+```C
+int parent(int a, int b, int c) {
+  int nested({=, &a}, int arg) { return a + b + arg; }
+}
+
+int coroutine_fn({%}, int arg) {
+  _Yield arg;
+  return 0;
+}
+
+struct S { int i; };
+int member_fn({struct S}, int arg) {
+  return i * arg;
+}
+```
+Calling would be like:
+```C
+nested({&ctx_obj}, 42);
+
+coroutine_fn({ctx_ptr}, 42);
+coroutine_fn({ctx_ptr}, ...); // resuming after yield
+
+member_fn({&obj.s}, 42);
+```
+Or with UFCS (uniform functiona call syntax)
+
+<small>(double-dots to avoid mixing up with member designation)</small>
+```C
+ctx_obj..nested(42);
+
+(*ctx_ptr)..coroutine_fn(42);
+(*ctx_ptr)..coroutine_fn(...); // resuming after yield
+
+obj.s..member_fn(42);
+```
+For recursive self-calling of a nested function, `{}` refers to its own context:
+```C
+int nested({&}, int i) {
+  return nested({}, 0);
+}
+```
+
+New keywords and builtins are introduced to support this model:
+ - `_Ctxof(fn)` is a `typeof`-like that returns the type of a function's capture context, it can be used to declare context objects on stack, or requrest `sizeof` and `alignof` for heap allocation. For nested functions it's all the reference or value of captured variables, for coroutines it is the entire stack frame.
+ - `__builtin_capture_init(ctx)` initializes a context object for a capturing function.
+ - `_Yield` is a `return`-like inside coroutines to suspend the control flow and return a value.
+
+And for managing wide function pointer:
+ - `_Wideof(fn)` is a `typeof`-like that returns the type of wide function pointer corresponding to a function.
+ - `__builtin_widefn_create(wfp, fn, ctx)` binds a pair of function(fn) and context pointer (ctx) into wide function pointer(wfp).
+ - `__builtin_widefn_get_ctx(wfp)` provide access to the context pointer so you can free it.
+
+Runnable example of closure-like usage, converted from Rosetta Code "Man or boy" [C++ std::function implementation](https://rosettacode.org/wiki/Man_or_boy_test#C++)
+```C
+#include <stdio.h>
+#include <stdlib.h>
+
+static void *to_free[16];
+static int free_cnt;
+
+void *alloc(size_t sz) {
+    if (free_cnt >= _Countof(to_free))
+        abort();
+    void *p = malloc(sz);
+    if (!p)
+        abort();
+    return to_free[free_cnt++] = p;
+}
+
+typedef _Wideof(int(void)) F;
+
+static int A(int k, const F *x1, const F *x2, const F *x3, const F *x4, const F *x5) {
+  F B;
+  int f({=, &k, &B}) {
+    return A(--k, &B, x1, x2, x3, x4);
+  }
+
+  _Ctxof(f) stk_ctx;
+  __builtin_capture_init(stk_ctx);
+  __builtin_widefn_create(B, f, &stk_ctx);
+
+  return k <= 0 ? (*x4)() + (*x5)() : B();
+}
+
+static F *L(int n) {
+  int f({n}) { return n; }
+
+  auto heap_ctx = (_Ctxof(f) *)alloc(sizeof(_Ctxof(f)));
+  __builtin_capture_init(*heap_ctx);
+
+  auto heap_wfn = (F *)alloc(sizeof(F));
+  __builtin_widefn_create(*heap_wfn, f, heap_ctx);
+
+  return heap_wfn;
+}
+
+int main() {
+  printf("%d\n", A(10, L(1), L(-1), L(-1), L(1), L(0))); // should be -67
+
+  for (int i = 0; i < free_cnt; i++)
+    free(to_free[i]);
+}
+```
+Runnable example of coroutine:
+```C
+#include <stdio.h>
+
+int coro({%}, int cnt) {
+  while (--cnt != 0) {
+    printf("yielding while %d\n", cnt);
+
+    _Yield cnt;
+  }
+  return cnt;
+}
+
+int main() {
+  _Ctxof(coro) ctx;
+
+  int result = coro({&ctx}, 5);
+
+  while (result != 0) {
+    printf("resuming while %d\n", result);
+
+    result = ctx..coro(...);
+  }
+  puts("done");
+}
+```
+More examples can befound in [the branch](https://github.com/fuhsnn/c-extensions/tree/extended-capture)'s `test/capture_*.c`.
 
 <a name="compat-ident"></a>
 ## Compatibility identifiers
