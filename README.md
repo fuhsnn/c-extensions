@@ -1,13 +1,18 @@
 This is a collection of extensions to C programming language implemented as patches to the [slimcc](https://github.com/fuhsnn/slimcc) compiler, done mostly for fun, may not be well thought out. They're kept in [separate branches](https://github.com/fuhsnn/c-extensions/branches) for better view-ability and to keep upstream codebase flexible. For building the compiler please refer to [upstream readme](https://github.com/fuhsnn/slimcc?tab=readme-ov-file#building-and-using). Examples may need `-std=c23` to build because slimcc hasn't default to that.
 
- - [`struct _Compat(ident) {...}`](#compat-ident)
- - [`for LoopName (...)`](#alt-named-loops-syntax)
- - [`[[gate(allowlist)]]`](#attr-gate)
- - [`_Match_type()`](#match-type)
- - [`_Match_int()`](#match-int)
+ - `struct _Compat(ident) {...}` [doc](#compat-ident) / [branch](https://github.com/fuhsnn/c-extensions/tree/compat-ident)
+ - - Make macro'd container types compatible without token pasting
+ - `for LoopName (...)` [doc](#alt-named-loops-syntax) / [branch](https://github.com/fuhsnn/c-extensions/tree/alt-named-loops-syntax)
+ - - Alternative named loops syntax
+ - `[[gate(allowlist)]]` [doc](#attr-gate) / [branch](https://github.com/fuhsnn/c-extensions/tree/attr-gate)
+ - - Limit external identifier access in macro'd code blocks
+ - `_Match_type()` [doc](#match-type) / [branch](https://github.com/fuhsnn/c-extensions/tree/match-type-int)
+ - - _Generic without semantic checking inactive branches
+ - `_Match_int()` [doc](#match-int) / [branch](https://github.com/fuhsnn/c-extensions/tree/match-type-int)
+ - - Compile time expression matching
 
 <a name="compat-ident"></a>
-## [Compatibility identifiers](https://github.com/fuhsnn/c-extensions/tree/compat-ident)
+## Compatibility identifiers
 
 It's a common idiom to do generic types with macros like:
 ```C
@@ -65,7 +70,7 @@ int main(void) {
 ```
 
 <a name="alt-named-loops-syntax"></a>
-## [Alternative C2Y named loops syntax](https://github.com/fuhsnn/c-extensions/tree/alt-named-loops-syntax)
+## Alternative C2Y named loops syntax
 
 An implementation of the [n3377 proposal to WG14](https://www.open-std.org/jtc1/sc22/wg14/www/docs/n3377.pdf) because I'm sympathetic to it.
 
@@ -102,7 +107,7 @@ int main(void) {
 ```
 
 <a name="attr-gate"></a>
-## [Block attribute `[[gate(allowlist)]]`](https://github.com/fuhsnn/c-extensions/tree/attr-gate)
+## Block attribute `[[gate(allowlist)]]`
 
 The attribute act as a guarded gate that only allow identifiers listed in `allowlist` to be referenced from inside the following block. It can be applied to normal blocks, secondary-blocks, statement-expressions as well as function bodies.
 ```C
@@ -170,7 +175,7 @@ int main(void) {
 ```
 
 <a name="match-type"></a>
-## [`_Match_type(type/expr, type:(expr), ...)`](https://github.com/fuhsnn/c-extensions/tree/match-type-int)
+## `_Match_type(type/expr, type:(expr), ...)`
 
 As a response to Simon Tatham's [Workarounds for C11 _Generic](https://www.chiark.greenend.org.uk/~sgtatham/quasiblog/c11-generic/), this is a version of `_Generic` that chooses from parentheses-balanced tokens without semantic checking until the selection is made. The result still needs to be a complete expression, more complex stuff can be done with statement-expression.
 
@@ -201,7 +206,7 @@ int main() {
 ```
 
 <a name="match-int"></a>
-## [`_Match_int(const_expr, const_expr:(expr), ...)`](https://github.com/fuhsnn/c-extensions/tree/match-type-int)
+## `_Match_int(const_expr, const_expr:(expr), ...)`
 
 Like `_Match_type` but chooses from integer constant expressions instead, in other words, compile-time expression selection with pattern-matching syntax. It also tries to be less sloppy by requiring case numbers to be the same integer type without implicit conversion.
 
